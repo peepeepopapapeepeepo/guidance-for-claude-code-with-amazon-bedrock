@@ -27,6 +27,14 @@ from claude_code_with_bedrock.cli.utils.cloudformation import CloudFormationMana
 from claude_code_with_bedrock.config import Config
 
 
+def _get_codebuild_region(profile):
+    windows_regions = {
+        "us-east-1", "us-east-2", "us-west-2", "ap-southeast-2",
+        "ap-northeast-1", "eu-central-1", "eu-west-1", "sa-east-1",
+    }
+    return profile.aws_region if profile.aws_region in windows_regions else "us-east-1"
+
+
 class DeployCommand(Command):
     name = "deploy"
     description = "Deploy AWS infrastructure (auth, monitoring, dashboards)"
@@ -169,16 +177,18 @@ class DeployCommand(Command):
             if getattr(profile, "sso_enabled", True):
                 stacks_to_deploy.append(("auth", "Authentication Stack (Cognito + IAM)"))
 
-            # Deploy distribution after networking if it's landing-page type
-            if profile.enable_distribution:
-                stacks_to_deploy.append(("distribution", "Distribution infrastructure (S3 + IAM)"))
-
-            # Deploy remaining monitoring stacks
+            # Deploy networking and s3bucket before distribution (distribution ALB needs VPC)
             if profile.monitoring_enabled:
                 vpc_config = profile.monitoring_config or {}
                 if vpc_config.get("create_vpc", True):
                     stacks_to_deploy.append(("networking", "VPC Networking for OTEL Collector"))
                 stacks_to_deploy.append(("s3bucket", "S3 Bucket"))
+
+            if profile.enable_distribution:
+                stacks_to_deploy.append(("distribution", "Distribution infrastructure (S3 + IAM)"))
+
+            # Deploy remaining monitoring stacks
+            if profile.monitoring_enabled:
                 stacks_to_deploy.append(("monitoring", "OpenTelemetry Collector"))
                 stacks_to_deploy.append(("dashboard", "CloudWatch Dashboard"))
                 stacks_to_deploy.append(("cowork-dashboard", "CoWork CloudWatch Dashboard"))
@@ -204,7 +214,11 @@ class DeployCommand(Command):
 
         for stack_type, description in stacks_to_deploy:
             stack_name = profile.stack_names.get(stack_type, f"{profile.identity_pool_name}-{stack_type}")
-            status = cf_manager.get_stack_status(stack_name)
+            if stack_type == "codebuild":
+                check_manager = CloudFormationManager(region=_get_codebuild_region(profile))
+            else:
+                check_manager = cf_manager
+            status = check_manager.get_stack_status(stack_name)
             if status and status in ["CREATE_COMPLETE", "UPDATE_COMPLETE", "UPDATE_ROLLBACK_COMPLETE"]:
                 status_display = "[green]Update[/green]"
             else:
@@ -305,18 +319,37 @@ class DeployCommand(Command):
                     # Convert parameters to boto3 format
                     boto3_params = self._convert_params_to_boto3(params) if params else None
 
+                    def handle_event(e):
+                        if isinstance(e, dict) and e.get("type") == "acm_validation_required":
+                            records = e.get("validation_records", [])
+                            if records:
+                                console.print("\n[bold yellow]" + "=" * 60 + "[/bold yellow]")
+                                console.print("[bold yellow]ACM Certificate DNS Validation Required![/bold yellow]")
+                                console.print("[bold yellow]" + "=" * 60 + "[/bold yellow]")
+                                console.print("\nCreate the following CNAME record(s) in your DNS provider:\n")
+                                for rec in records:
+                                    console.print(f"  [bold]Name:[/bold]  [cyan]{rec['Name']}[/cyan]")
+                                    console.print(f"  [bold]Value:[/bold] [cyan]{rec['Value']}[/cyan]")
+                                    console.print()
+                                console.print(
+                                    "[yellow]Deployment will continue once DNS records are verified.[/yellow]"
+                                )
+                                console.print("[bold yellow]" + "=" * 60 + "[/bold yellow]\n")
+                        else:
+                            progress.update(
+                                task,
+                                description=f"{e.get('LogicalResourceId', 'Stack')} - {e.get('ResourceStatus', '')}"
+                                if isinstance(e, dict)
+                                else str(e),
+                            )
+
                     # Deploy stack
                     result = cf_manager.deploy_stack(
                         stack_name=stack_name,
                         template_path=template_path,
                         parameters=boto3_params,
                         capabilities=capabilities or ["CAPABILITY_IAM"],
-                        on_event=lambda e: progress.update(
-                            task,
-                            description=f"{e.get('LogicalResourceId', 'Stack')} - {e.get('ResourceStatus', '')}"
-                            if isinstance(e, dict)
-                            else str(e),
-                        ),
+                        on_event=handle_event,
                     )
 
                     progress.update(task, completed=True)
@@ -431,7 +464,6 @@ class DeployCommand(Command):
                             f"CognitoUserPoolDomain={cognito_domain}",
                         ]
                     )
-
                 # Use profile regions, or fall back to all known Bedrock regions
                 bedrock_regions = profile.allowed_bedrock_regions
                 if not bedrock_regions:
@@ -506,10 +538,13 @@ class DeployCommand(Command):
                             ]
                         )
                     elif profile.distribution_idp_provider == "azure":
-                        # Extract tenant ID from domain or use full domain
+                        # Extract tenant ID GUID from domain URL
+                        _guid_pat = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+                        _tenant_match = re.search(_guid_pat, profile.distribution_idp_domain or "")
+                        _tenant_id = _tenant_match.group(0) if _tenant_match else profile.distribution_idp_domain
                         params.extend(
                             [
-                                f"AzureTenantId={profile.distribution_idp_domain}",
+                                f"AzureTenantId={_tenant_id}",
                                 f"AzureClientId={profile.distribution_idp_client_id}",
                                 f"AzureClientSecretArn={profile.distribution_idp_client_secret_arn}",
                             ]
@@ -532,7 +567,6 @@ class DeployCommand(Command):
                                 f"CognitoClientSecretArn={profile.distribution_idp_client_secret_arn}",
                             ]
                         )
-
                     # Add optional custom domain parameters
                     if profile.distribution_custom_domain:
                         params.append(f"CustomDomainName={profile.distribution_custom_domain}")
@@ -564,6 +598,19 @@ class DeployCommand(Command):
                             "\n   Add this redirect URI to your IdP web application settings "
                             "before users can authenticate."
                         )
+
+                        # Show external DNS instructions if not using Route53
+                        if not profile.distribution_hosted_zone_id:
+                            alb_dns = outputs.get("ALBEndpoint", "")
+                            if alb_dns:
+                                console.print("\n[bold yellow]External DNS Configuration Required:[/bold yellow]")
+                                console.print(
+                                    "  Create a CNAME record in your DNS provider:"
+                                )
+                                console.print(
+                                    f"    [cyan]{profile.distribution_custom_domain}[/cyan]"
+                                    f" -> [cyan]{alb_dns}[/cyan]"
+                                )
 
                     return result
 
@@ -629,6 +676,7 @@ class DeployCommand(Command):
                 monitoring_config = getattr(profile, "monitoring_config", {})
                 if monitoring_config.get("custom_domain"):
                     params.append(f"CustomDomainName={monitoring_config['custom_domain']}")
+                if monitoring_config.get("hosted_zone_id"):
                     params.append(f"HostedZoneId={monitoring_config['hosted_zone_id']}")
                     # Add OIDC JWT validation parameters for ALB (all IdP types)
                     provider_type = profile.provider_type or ""
@@ -667,10 +715,66 @@ class DeployCommand(Command):
                             params.append(f"OidcJwksEndpoint={oidc_jwks}")
                             params.append(f"OidcClientId={profile.client_id}")
 
+                # Add OIDC JWT validation parameters for ALB (all IdP types)
+                if monitoring_config.get("custom_domain"):
+                    provider_type = getattr(profile, 'provider_type', '')
+                    provider_domain = getattr(profile, 'provider_domain', '')
+                    if provider_type and provider_domain:
+                        oidc_issuer = ''
+                        oidc_jwks = ''
+                        if provider_type == 'azure':
+                            _uuid_re = (
+                                r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
+                                r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+                            )
+                            _m = re.search(_uuid_re, provider_domain)
+                            if _m:
+                                tid = _m.group(0)
+                                oidc_issuer = f"https://login.microsoftonline.com/{tid}/v2.0"
+                                oidc_jwks = f"https://login.microsoftonline.com/{tid}/discovery/v2.0/keys"
+                        elif provider_type == 'okta':
+                            # provider_domain is e.g. "company.okta.com"
+                            domain = provider_domain.rstrip('/')
+                            oidc_issuer = f"https://{domain}/oauth2/default"
+                            oidc_jwks = f"https://{domain}/oauth2/default/v1/keys"
+                        elif provider_type == 'auth0':
+                            domain = provider_domain.rstrip('/')
+                            oidc_issuer = f"https://{domain}/"
+                            oidc_jwks = f"https://{domain}/.well-known/jwks.json"
+                        elif provider_type == 'cognito':
+                            # Cognito issuer uses cognito-idp endpoint, not the hosted UI domain
+                            pool_id = getattr(profile, 'cognito_user_pool_id', '')
+                            if pool_id:
+                                # Extract region from pool ID (format: us-east-1_AbCdEfGhI)
+                                pool_region = pool_id.split('_')[0] if '_' in pool_id else profile.aws_region
+                                oidc_issuer = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
+                                oidc_jwks = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}/.well-known/jwks.json"
+                        if oidc_issuer and oidc_jwks:
+                            params.append(f"OidcIssuerUrl={oidc_issuer}")
+                            params.append(f"OidcJwksEndpoint={oidc_jwks}")
+
                 console.print(f"[dim]Using parameters: {params}[/dim]")
-                return deploy_with_cf(
+                result = deploy_with_cf(
                     template, stack_name, params, task_description="Deploying monitoring collector..."
                 )
+
+                # Show external DNS instructions if custom domain without Route53
+                if (
+                    result == 0
+                    and monitoring_config.get("custom_domain")
+                    and not monitoring_config.get("hosted_zone_id")
+                ):
+                    outputs = get_stack_outputs(stack_name, profile.aws_region)
+                    alb_dns = outputs.get("ALBEndpoint", "")
+                    if alb_dns:
+                        console.print("\n[bold yellow]External DNS Configuration Required:[/bold yellow]")
+                        console.print("  Create a CNAME record in your DNS provider:")
+                        console.print(
+                            f"    [cyan]{monitoring_config['custom_domain']}[/cyan]"
+                            f" -> [cyan]{alb_dns}[/cyan]"
+                        )
+
+                return result
 
             elif stack_type == "dashboard":
                 template = project_root / "deployment" / "infrastructure" / "claude-code-dashboard.yaml"
@@ -900,6 +1004,7 @@ class DeployCommand(Command):
                             pass
 
             elif stack_type == "codebuild":
+                cf_manager = CloudFormationManager(region=_get_codebuild_region(profile))
                 template = project_root / "deployment" / "infrastructure" / "codebuild-windows.yaml"
                 stack_name = profile.stack_names.get("codebuild", f"{profile.identity_pool_name}-codebuild")
                 params = [f"ProjectNamePrefix={profile.identity_pool_name}"]
@@ -1278,7 +1383,13 @@ class DeployCommand(Command):
             if stack_type not in deploying_types:
                 # This stack type is not being deployed - check if it exists
                 stack_name = profile.stack_names.get(stack_type, f"{profile.identity_pool_name}-{stack_type}")
-                status = cf_manager.get_stack_status(stack_name)
+                if stack_type == "codebuild":
+                    check_manager = CloudFormationManager(
+                        region=_get_codebuild_region(profile)
+                    )
+                else:
+                    check_manager = cf_manager
+                status = check_manager.get_stack_status(stack_name)
 
                 if status and status not in ["DELETE_COMPLETE", "DELETE_IN_PROGRESS"]:
                     orphaned.append((stack_type, stack_name, status))
