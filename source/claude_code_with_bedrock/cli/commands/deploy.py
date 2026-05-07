@@ -710,48 +710,14 @@ class DeployCommand(Command):
                                 oidc_jwks = (
                                     f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}/.well-known/jwks.json"
                                 )
+                        elif provider_type == "keycloak":
+                            domain = provider_domain.removeprefix("https://").removeprefix("http://").rstrip("/")
+                            oidc_issuer = f"https://{domain}"
+                            oidc_jwks = f"https://{domain}/protocol/openid-connect/certs"
                         if oidc_issuer and oidc_jwks:
                             params.append(f"OidcIssuerUrl={oidc_issuer}")
                             params.append(f"OidcJwksEndpoint={oidc_jwks}")
                             params.append(f"OidcClientId={profile.client_id}")
-
-                # Add OIDC JWT validation parameters for ALB (all IdP types)
-                if monitoring_config.get("custom_domain"):
-                    provider_type = getattr(profile, 'provider_type', '')
-                    provider_domain = getattr(profile, 'provider_domain', '')
-                    if provider_type and provider_domain:
-                        oidc_issuer = ''
-                        oidc_jwks = ''
-                        if provider_type == 'azure':
-                            _uuid_re = (
-                                r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-'
-                                r'[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
-                            )
-                            _m = re.search(_uuid_re, provider_domain)
-                            if _m:
-                                tid = _m.group(0)
-                                oidc_issuer = f"https://login.microsoftonline.com/{tid}/v2.0"
-                                oidc_jwks = f"https://login.microsoftonline.com/{tid}/discovery/v2.0/keys"
-                        elif provider_type == 'okta':
-                            # provider_domain is e.g. "company.okta.com"
-                            domain = provider_domain.rstrip('/')
-                            oidc_issuer = f"https://{domain}/oauth2/default"
-                            oidc_jwks = f"https://{domain}/oauth2/default/v1/keys"
-                        elif provider_type == 'auth0':
-                            domain = provider_domain.rstrip('/')
-                            oidc_issuer = f"https://{domain}/"
-                            oidc_jwks = f"https://{domain}/.well-known/jwks.json"
-                        elif provider_type == 'cognito':
-                            # Cognito issuer uses cognito-idp endpoint, not the hosted UI domain
-                            pool_id = getattr(profile, 'cognito_user_pool_id', '')
-                            if pool_id:
-                                # Extract region from pool ID (format: us-east-1_AbCdEfGhI)
-                                pool_region = pool_id.split('_')[0] if '_' in pool_id else profile.aws_region
-                                oidc_issuer = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}"
-                                oidc_jwks = f"https://cognito-idp.{pool_region}.amazonaws.com/{pool_id}/.well-known/jwks.json"
-                        if oidc_issuer and oidc_jwks:
-                            params.append(f"OidcIssuerUrl={oidc_issuer}")
-                            params.append(f"OidcJwksEndpoint={oidc_jwks}")
 
                 console.print(f"[dim]Using parameters: {params}[/dim]")
                 result = deploy_with_cf(
