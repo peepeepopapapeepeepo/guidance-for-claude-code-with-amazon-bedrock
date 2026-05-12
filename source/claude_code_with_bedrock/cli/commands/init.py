@@ -1336,150 +1336,148 @@ class InitCommand(Command):
                 config["aws"]["default_sonnet_model"] = None
                 config["aws"]["default_haiku_model"] = None
                 console.print("[green]✓[/green] Auto-select: Claude Code will select models for your region")
-                progress.save_step("bedrock_complete", config)
-                return config
-
-            config["aws"]["cross_region_profile"] = selected_profile
-            console.print(f"[green]✓[/green] Profile: {selected_profile}")
-
-            # Q3: Claude model (filtered by profile; Auto-select exits Q4-Q6)
-            _AUTO_MODEL = "__auto__"
-            model_choices: list[questionary.Choice] = [
-                questionary.Choice("Auto-select — don't set ANTHROPIC_MODEL", value=_AUTO_MODEL)
-            ]
-            for model_key, model_config in CLAUDE_MODELS.items():
-                if resolve_profile_key(model_key, selected_profile) is None:
-                    continue
-                model_choices.append(questionary.Choice(cast(str, model_config["name"]), value=model_key))
-
-            _default_model = next(
-                (c for c in model_choices if c.value == (saved_model_key or _AUTO_MODEL)),
-                model_choices[0],
-            )
-            selected_model_key = questionary.select(
-                "Select Claude model:",
-                choices=model_choices,
-                default=_default_model,
-                instruction="(Use arrow keys to select, Enter to confirm)",
-            ).ask()
-
-            if selected_model_key is None:  # User cancelled
-                return None
-
-            if selected_model_key == _AUTO_MODEL:
-                config["aws"]["selected_model"] = None
-                # Profile is known; use its destination regions instead of wildcard
-                profile_dest_regions = get_all_destination_regions_for_profile(selected_profile)
-                config["aws"]["allowed_bedrock_regions"] = (
-                    profile_dest_regions if profile_dest_regions else get_all_destination_regions()
-                )
-                console.print("[green]✓[/green] Auto-select: Claude Code will choose the model automatically")
             else:
-                model_id = get_model_id_for_profile(selected_model_key, selected_profile)
-                config["aws"]["selected_model"] = model_id
-                console.print(f"[green]✓[/green] Model: {CLAUDE_MODELS[selected_model_key]['name']}")
+                config["aws"]["cross_region_profile"] = selected_profile
+                console.print(f"[green]✓[/green] Profile: {selected_profile}")
 
-                destination_regions = get_destination_regions_for_model_profile(selected_model_key, selected_profile)
-                if not destination_regions:
-                    console.print(
-                        f"[red]Error:[/red] No destination regions configured for {selected_model_key} "
-                        f"with {selected_profile} profile"
-                    )
-                    raise ValueError("No destination regions configured for model/profile combination")
-                config["aws"]["allowed_bedrock_regions"] = destination_regions
-
-            # Q4-Q6: Default tier models (per-tier Auto-select = don't set that env var)
-            _AUTO_TIER = "__auto__"
-            tier_config_keys = {
-                "opus": "default_opus_model",
-                "sonnet": "default_sonnet_model",
-                "haiku": "default_haiku_model",
-            }
-            for tier in ["opus", "sonnet", "haiku"]:
-                tier_models = get_models_for_tier(tier, selected_profile)
-                if not tier_models:
-                    config["aws"][tier_config_keys[tier]] = None
-                    continue
-
-                tc: list[questionary.Choice] = [
-                    questionary.Choice(
-                        f"Auto-select — don't set ANTHROPIC_DEFAULT_{tier.upper()}_MODEL",
-                        value=_AUTO_TIER,
-                    )
+                # Q3: Claude model (filtered by profile; Auto-select exits Q4-Q6)
+                _AUTO_MODEL = "__auto__"
+                model_choices: list[questionary.Choice] = [
+                    questionary.Choice("Auto-select — don't set ANTHROPIC_MODEL", value=_AUTO_MODEL)
                 ]
-                for mk, display_name, _mid in reversed(tier_models):
-                    tc.append(questionary.Choice(display_name, value=mk))
-
-                _saved_key = saved_tier_keys[tier]
-                _default_t = next((c for c in tc if c.value == (_saved_key or _AUTO_TIER)), tc[0])
-                chosen = questionary.select(
-                    f"Select default {tier.capitalize()} model:",
-                    choices=tc,
-                    default=_default_t,
+                for model_key, model_config in CLAUDE_MODELS.items():
+                    if resolve_profile_key(model_key, selected_profile) is None:
+                        continue
+                    model_choices.append(questionary.Choice(cast(str, model_config["name"]), value=model_key))
+    
+                _default_model = next(
+                    (c for c in model_choices if c.value == (saved_model_key or _AUTO_MODEL)),
+                    model_choices[0],
+                )
+                selected_model_key = questionary.select(
+                    "Select Claude model:",
+                    choices=model_choices,
+                    default=_default_model,
                     instruction="(Use arrow keys to select, Enter to confirm)",
                 ).ask()
-
-                if chosen is None:  # User cancelled
+    
+                if selected_model_key is None:  # User cancelled
                     return None
-
-                if chosen == _AUTO_TIER:
-                    config["aws"][tier_config_keys[tier]] = None
-                    console.print(f"[green]✓[/green] Default {tier}: Auto-select")
+    
+                if selected_model_key == _AUTO_MODEL:
+                    config["aws"]["selected_model"] = None
+                    # Profile is known; use its destination regions instead of wildcard
+                    profile_dest_regions = get_all_destination_regions_for_profile(selected_profile)
+                    config["aws"]["allowed_bedrock_regions"] = (
+                        profile_dest_regions if profile_dest_regions else get_all_destination_regions()
+                    )
+                    console.print("[green]✓[/green] Auto-select: Claude Code will choose the model automatically")
                 else:
-                    tier_model_id = get_model_id_for_profile(chosen, selected_profile)
-                    config["aws"][tier_config_keys[tier]] = tier_model_id
-                    console.print(f"[green]✓[/green] Default {tier}: {CLAUDE_MODELS[chosen]['name']}")
-
-            # Optional: Application Inference Profiles
-            has_saved_arns = any(
-                config.get("aws", {}).get(k)
-                for k in ["inference_profile_opus_arn", "inference_profile_sonnet_arn", "inference_profile_haiku_arn"]
-            )
-            use_inference_profiles = questionary.confirm(
-                "Configure Application Inference Profiles?",
-                default=has_saved_arns,
-            ).ask()
-
-            if use_inference_profiles:
-                from claude_code_with_bedrock.validators import ProfileValidator
-
-                console.print("[dim]Provide an inference profile ARN for each model tier (press Enter to skip).[/dim]")
-
-                for tier_name, config_key in [
-                    ("Opus", "inference_profile_opus_arn"),
-                    ("Sonnet", "inference_profile_sonnet_arn"),
-                    ("Haiku", "inference_profile_haiku_arn"),
-                ]:
-                    saved_arn = config.get("aws", {}).get(config_key)
-                    while True:
-                        arn = questionary.text(
-                            f"  {tier_name} inference profile ARN:",
-                            default=saved_arn or "",
-                        ).ask()
-
-                        if arn is None:  # User cancelled
-                            config["aws"][config_key] = None
+                    model_id = get_model_id_for_profile(selected_model_key, selected_profile)
+                    config["aws"]["selected_model"] = model_id
+                    console.print(f"[green]✓[/green] Model: {CLAUDE_MODELS[selected_model_key]['name']}")
+    
+                    destination_regions = get_destination_regions_for_model_profile(selected_model_key, selected_profile)
+                    if not destination_regions:
+                        console.print(
+                            f"[red]Error:[/red] No destination regions configured for {selected_model_key} "
+                            f"with {selected_profile} profile"
+                        )
+                        raise ValueError("No destination regions configured for model/profile combination")
+                    config["aws"]["allowed_bedrock_regions"] = destination_regions
+    
+                # Q4-Q6: Default tier models (per-tier Auto-select = don't set that env var)
+                _AUTO_TIER = "__auto__"
+                tier_config_keys = {
+                    "opus": "default_opus_model",
+                    "sonnet": "default_sonnet_model",
+                    "haiku": "default_haiku_model",
+                }
+                for tier in ["opus", "sonnet", "haiku"]:
+                    tier_models = get_models_for_tier(tier, selected_profile)
+                    if not tier_models:
+                        config["aws"][tier_config_keys[tier]] = None
+                        continue
+    
+                    tc: list[questionary.Choice] = [
+                        questionary.Choice(
+                            f"Auto-select — don't set ANTHROPIC_DEFAULT_{tier.upper()}_MODEL",
+                            value=_AUTO_TIER,
+                        )
+                    ]
+                    for mk, display_name, _mid in reversed(tier_models):
+                        tc.append(questionary.Choice(display_name, value=mk))
+    
+                    _saved_key = saved_tier_keys[tier]
+                    _default_t = next((c for c in tc if c.value == (_saved_key or _AUTO_TIER)), tc[0])
+                    chosen = questionary.select(
+                        f"Select default {tier.capitalize()} model:",
+                        choices=tc,
+                        default=_default_t,
+                        instruction="(Use arrow keys to select, Enter to confirm)",
+                    ).ask()
+    
+                    if chosen is None:  # User cancelled
+                        return None
+    
+                    if chosen == _AUTO_TIER:
+                        config["aws"][tier_config_keys[tier]] = None
+                        console.print(f"[green]✓[/green] Default {tier}: Auto-select")
+                    else:
+                        tier_model_id = get_model_id_for_profile(chosen, selected_profile)
+                        config["aws"][tier_config_keys[tier]] = tier_model_id
+                        console.print(f"[green]✓[/green] Default {tier}: {CLAUDE_MODELS[chosen]['name']}")
+    
+                # Optional: Application Inference Profiles
+                has_saved_arns = any(
+                    config.get("aws", {}).get(k)
+                    for k in ["inference_profile_opus_arn", "inference_profile_sonnet_arn", "inference_profile_haiku_arn"]
+                )
+                use_inference_profiles = questionary.confirm(
+                    "Configure Application Inference Profiles?",
+                    default=has_saved_arns,
+                ).ask()
+    
+                if use_inference_profiles:
+                    from claude_code_with_bedrock.validators import ProfileValidator
+    
+                    console.print("[dim]Provide an inference profile ARN for each model tier (press Enter to skip).[/dim]")
+    
+                    for tier_name, config_key in [
+                        ("Opus", "inference_profile_opus_arn"),
+                        ("Sonnet", "inference_profile_sonnet_arn"),
+                        ("Haiku", "inference_profile_haiku_arn"),
+                    ]:
+                        saved_arn = config.get("aws", {}).get(config_key)
+                        while True:
+                            arn = questionary.text(
+                                f"  {tier_name} inference profile ARN:",
+                                default=saved_arn or "",
+                            ).ask()
+    
+                            if arn is None:  # User cancelled
+                                config["aws"][config_key] = None
+                                break
+    
+                            if not arn.strip():
+                                config["aws"][config_key] = None
+                                break
+    
+                            error = ProfileValidator.validate_application_inference_profile_arn(arn)
+                            if error:
+                                console.print(f"[red]{error}[/red]")
+                                continue
+    
+                            config["aws"][config_key] = arn.strip()
+                            console.print(f"[green]✓[/green] {tier_name} inference profile configured")
                             break
-
-                        if not arn.strip():
-                            config["aws"][config_key] = None
-                            break
-
-                        error = ProfileValidator.validate_application_inference_profile_arn(arn)
-                        if error:
-                            console.print(f"[red]{error}[/red]")
-                            continue
-
-                        config["aws"][config_key] = arn.strip()
-                        console.print(f"[green]✓[/green] {tier_name} inference profile configured")
-                        break
-            else:
-                config["aws"]["inference_profile_opus_arn"] = None
-                config["aws"]["inference_profile_sonnet_arn"] = None
-                config["aws"]["inference_profile_haiku_arn"] = None
-
-            # Save progress
-            progress.save_step("bedrock_complete", config)
+                else:
+                    config["aws"]["inference_profile_opus_arn"] = None
+                    config["aws"]["inference_profile_sonnet_arn"] = None
+                    config["aws"]["inference_profile_haiku_arn"] = None
+    
+                # Save progress
+                progress.save_step("bedrock_complete", config)
 
         # Resource Tags (optional)
         console.print("\n[bold blue]Resource Tags (Optional)[/bold blue]")
