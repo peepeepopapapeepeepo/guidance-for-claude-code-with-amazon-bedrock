@@ -342,12 +342,16 @@ class DeployCommand(Command):
                                 else str(e),
                             )
 
+                    # Build tags from profile configuration
+                    stack_tags = dict(profile.tags) if profile.tags else {}
+
                     # Deploy stack
                     result = cf_manager.deploy_stack(
                         stack_name=stack_name,
                         template_path=template_path,
                         parameters=boto3_params,
                         capabilities=capabilities or ["CAPABILITY_IAM"],
+                        tags=stack_tags or None,
                         on_event=handle_event,
                     )
 
