@@ -312,7 +312,31 @@ def write_cached_headers(headers, token_exp):
 
 
 def get_token_via_credential_process():
-    """Get monitoring token via credential-process to avoid direct keychain access"""
+    """Get monitoring token: try direct cache file first, fall back to credential-process subprocess.
+
+    The credential-provider writes a fresh JWT to ~/.claude-code-session/<profile>-monitoring.json
+    after each refresh. Reading it directly bypasses the 30s subprocess timeout in the common
+    case where the cache is valid. Subprocess fallback covers cold start and hard expiry.
+    """
+    # Get profile name from AWS_PROFILE environment variable (set by Claude Code from settings.json)
+    # Fall back to "ClaudeCode" for backward compatibility
+    profile = os.environ.get("AWS_PROFILE", "ClaudeCode")
+
+    # Layer 0: Direct file read of the credential-provider's monitoring token cache.
+    cache_file = Path.home() / ".claude-code-session" / f"{profile}-monitoring.json"
+    if cache_file.exists():
+        try:
+            with open(cache_file) as f:
+                cached = json.load(f)
+            cached_token = cached.get("token")
+            expires = cached.get("expires", 0)
+            # 60s buffer matches credential-provider's expiry semantics
+            if cached_token and expires - time.time() > 60:
+                logger.info(f"Using cached monitoring token (expires in {int(expires - time.time())}s)")
+                return cached_token
+        except Exception as e:
+            logger.debug(f"Failed to read monitoring token cache: {e}")
+
     logger.info("Getting token via credential-process...")
 
     # Path to credential process - add .exe extension on Windows
@@ -327,10 +351,6 @@ def get_token_via_credential_process():
     if not os.path.exists(credential_process):
         logger.warning(f"Credential process not found at {credential_process}")
         return None
-
-    # Get profile name from AWS_PROFILE environment variable (set by Claude Code from settings.json)
-    # Fall back to "ClaudeCode" for backward compatibility
-    profile = os.environ.get("AWS_PROFILE", "ClaudeCode")
 
     try:
         # Run credential process with --profile flag and --get-monitoring-token flag
@@ -608,6 +628,31 @@ def create_anonymous_user_info(caller_identity=None):
         }
 
 
+def build_proxy_user_headers():
+    """Return enrichment headers derived from the cached monitoring token.
+
+    Used by the OTLP proxy mode (run_proxy) to inject user identity headers and
+    a Bearer token onto every forwarded request. Module-level so tests can call
+    it directly without binding a real socket via run_proxy.
+    """
+    token = None
+    if not ANONYMOUS_MODE:
+        token = os.environ.get("CLAUDE_CODE_MONITORING_TOKEN") or get_token_via_credential_process()
+
+    if token:
+        payload = decode_jwt_payload(token)
+        user_info = extract_user_info(payload)
+    else:
+        caller_identity = get_aws_caller_identity()
+        user_info = create_anonymous_user_info(caller_identity)
+
+    headers = format_as_headers_dict(user_info)
+    # Forward Bearer token so the upstream collector's ALB JWT validation accepts the request
+    if token:
+        headers["authorization"] = f"Bearer {token}"
+    return headers
+
+
 def run_proxy(target_url: str, port: int = 4318):
     """Run a local OTLP proxy that injects user identity headers before forwarding.
 
@@ -624,21 +669,6 @@ def run_proxy(target_url: str, port: int = 4318):
     target_url = target_url.rstrip("/")
     logger.info(f"Starting OTLP proxy on port {port}, forwarding to {target_url}")
 
-    def get_user_headers():
-        """Return enrichment headers derived from the cached monitoring token."""
-        token = None
-        if not ANONYMOUS_MODE:
-            token = os.environ.get("CLAUDE_CODE_MONITORING_TOKEN") or get_token_via_credential_process()
-
-        if token:
-            payload = decode_jwt_payload(token)
-            user_info = extract_user_info(payload)
-        else:
-            caller_identity = get_aws_caller_identity()
-            user_info = create_anonymous_user_info(caller_identity)
-
-        return format_as_headers_dict(user_info)
-
     # Pre-fetch headers once at startup; refresh on each request so token
     # rotations are picked up without restarting the proxy.
     _header_cache = {"headers": {}, "fetched_at": 0}
@@ -648,7 +678,7 @@ def run_proxy(target_url: str, port: int = 4318):
         now = time.time()
         if now - _header_cache["fetched_at"] > _HEADER_REFRESH_SECONDS:
             try:
-                _header_cache["headers"] = get_user_headers()
+                _header_cache["headers"] = build_proxy_user_headers()
                 _header_cache["fetched_at"] = now
             except Exception as e:
                 logger.warning(f"Could not refresh user headers: {e}")
@@ -831,6 +861,10 @@ def main():
 
         # Generate headers dictionary
         headers_dict = format_as_headers_dict(user_info)
+        # Forward Bearer token for ALB OIDC JWT validation on the OTEL collector endpoint.
+        # Harmless when the collector does not validate JWTs - the header is ignored.
+        if token:
+            headers_dict["authorization"] = f"Bearer {token}"
         # In test mode, print detailed output
         if TEST_MODE:
             print("===== TEST MODE OUTPUT =====\n")

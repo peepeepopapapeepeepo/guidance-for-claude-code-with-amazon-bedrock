@@ -1198,6 +1198,7 @@ class InitCommand(Command):
                 console.print("Searching for deployed Cognito User Pool stack...")
 
                 # Try to auto-detect Cognito stack
+                region = config.get("aws", {}).get("region", get_current_region())
                 cognito_stack_info = detect_cognito_stack(region)
 
                 if cognito_stack_info:
